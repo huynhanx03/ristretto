@@ -37,7 +37,7 @@ type defaultPolicy[V any] struct {
 func newDefaultPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
 	p := &defaultPolicy[V]{
 		admit:   newTinyLFU(numCounters),
-		evict:   newSampledLFU(maxCost),
+		evict:   newSampledLFU(maxCost, numCounters),
 		itemsCh: make(chan []uint64, 3),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -253,9 +253,11 @@ type sampledLFU struct {
 	keyCosts map[uint64]int64
 }
 
-func newSampledLFU(maxCost int64) *sampledLFU {
+func newSampledLFU(maxCost, numCounters int64) *sampledLFU {
 	return &sampledLFU{
-		keyCosts: make(map[uint64]int64),
+		// Pre-allocate keyCosts assuming the recommended 10:1 counter-to-item ratio
+		// to minimize map resizing.
+		keyCosts: make(map[uint64]int64, numCounters/10),
 		maxCost:  maxCost,
 	}
 }
