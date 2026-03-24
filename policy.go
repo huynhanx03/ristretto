@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	pkgsync "github.com/dgraph-io/ristretto/v2/pkg/sync"
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 
@@ -24,18 +25,21 @@ func newPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
 }
 
 type defaultPolicy[V any] struct {
-	sync.Mutex
-	admit    *tinyLFU
-	evict    *sampledLFU
-	itemsCh  chan []uint64
-	stop     chan struct{}
-	done     chan struct{}
+	admit   *tinyLFU
+	evict   *sampledLFU
+	itemsCh chan []uint64
+	stop    chan struct{}
+	done    chan struct{}
+	admitMu sync.Locker
+	evictMu sync.Locker
 	isClosed bool
 	metrics  *Metrics
 }
 
 func newDefaultPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
 	p := &defaultPolicy[V]{
+		admitMu: pkgsync.NewSpinLock(),
+		evictMu: pkgsync.NewSpinLock(),
 		admit:   newTinyLFU(numCounters),
 		evict:   newSampledLFU(maxCost, numCounters),
 		itemsCh: make(chan []uint64, 3),
@@ -60,9 +64,9 @@ func (p *defaultPolicy[V]) processItems() {
 	for {
 		select {
 		case items := <-p.itemsCh:
-			p.Lock()
+			p.admitMu.Lock()
 			p.admit.Push(items)
-			p.Unlock()
+			p.admitMu.Unlock()
 		case <-p.stop:
 			p.done <- struct{}{}
 			return
@@ -93,8 +97,8 @@ func (p *defaultPolicy[V]) Push(keys []uint64) bool {
 // the policy. It returns the list of victims that have been evicted and a boolean
 // indicating whether the incoming item should be accepted.
 func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
-	p.Lock()
-	defer p.Unlock()
+	p.evictMu.Lock()
+	defer p.evictMu.Unlock()
 
 	// Cannot add an item bigger than entire cache.
 	if cost > p.evict.getMaxCost() {
@@ -119,7 +123,10 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	}
 
 	// incHits is the hit count for the incoming item.
+	p.admitMu.Lock()
 	incHits := p.admit.Estimate(key)
+	p.admitMu.Unlock()
+
 	// sample is the eviction candidate pool to be filled via random sampling.
 	// TODO: perhaps we should use a min heap here. Right now our time
 	// complexity is N for finding the min. Min heap should bring it down to
@@ -136,12 +143,14 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 
 		// Find minimally used item in sample.
 		minKey, minHits, minId, minCost := uint64(0), int64(math.MaxInt64), 0, int64(0)
+		p.admitMu.Lock()
 		for i, pair := range sample {
 			// Look up hit count for sample key.
 			if hits := p.admit.Estimate(pair.key); hits < minHits {
 				minKey, minHits, minId, minCost = pair.key, hits, i, pair.cost
 			}
 		}
+		p.admitMu.Unlock()
 
 		// If the incoming item isn't worth keeping in the policy, reject.
 		if incHits < minHits {
@@ -169,46 +178,49 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 }
 
 func (p *defaultPolicy[V]) Has(key uint64) bool {
-	p.Lock()
+	p.evictMu.Lock()
 	_, exists := p.evict.keyCosts[key]
-	p.Unlock()
+	p.evictMu.Unlock()
 	return exists
 }
 
 func (p *defaultPolicy[V]) Del(key uint64) {
-	p.Lock()
+	p.evictMu.Lock()
 	p.evict.del(key)
-	p.Unlock()
+	p.evictMu.Unlock()
 }
 
 func (p *defaultPolicy[V]) Cap() int64 {
-	p.Lock()
+	p.evictMu.Lock()
 	capacity := p.evict.getMaxCost() - p.evict.used
-	p.Unlock()
+	p.evictMu.Unlock()
 	return capacity
 }
 
 func (p *defaultPolicy[V]) Update(key uint64, cost int64) {
-	p.Lock()
+	p.evictMu.Lock()
 	p.evict.updateIfHas(key, cost)
-	p.Unlock()
+	p.evictMu.Unlock()
 }
 
 func (p *defaultPolicy[V]) Cost(key uint64) int64 {
-	p.Lock()
+	p.evictMu.Lock()
 	if cost, found := p.evict.keyCosts[key]; found {
-		p.Unlock()
+		p.evictMu.Unlock()
 		return cost
 	}
-	p.Unlock()
+	p.evictMu.Unlock()
 	return -1
 }
 
 func (p *defaultPolicy[V]) Clear() {
-	p.Lock()
-	p.admit.clear()
+	p.evictMu.Lock()
 	p.evict.clear()
-	p.Unlock()
+	p.evictMu.Unlock()
+
+	p.admitMu.Lock()
+	p.admit.clear()
+	p.admitMu.Unlock()
 }
 
 func (p *defaultPolicy[V]) Close() {

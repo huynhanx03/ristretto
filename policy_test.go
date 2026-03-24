@@ -30,18 +30,18 @@ func TestPolicyProcessItems(t *testing.T) {
 	p := newDefaultPolicy[int](100, 10)
 	p.itemsCh <- []uint64{1, 2, 2}
 	time.Sleep(wait)
-	p.Lock()
+	p.admitMu.Lock()
 	require.Equal(t, int64(2), p.admit.Estimate(2))
 	require.Equal(t, int64(1), p.admit.Estimate(1))
-	p.Unlock()
+	p.admitMu.Unlock()
 
 	p.stop <- struct{}{}
 	<-p.done
 	p.itemsCh <- []uint64{3, 3, 3}
 	time.Sleep(wait)
-	p.Lock()
+	p.admitMu.Lock()
 	require.Equal(t, int64(0), p.admit.Estimate(3))
-	p.Unlock()
+	p.admitMu.Unlock()
 }
 
 func TestPolicyPush(t *testing.T) {
@@ -62,12 +62,14 @@ func TestPolicyAdd(t *testing.T) {
 	if victims, added := p.Add(1, 101); victims != nil || added {
 		t.Fatal("can't add an item bigger than entire cache")
 	}
-	p.Lock()
+	p.evictMu.Lock()
 	p.evict.add(1, 1)
+	p.evictMu.Unlock()
+	p.admitMu.Lock()
 	p.admit.Increment(1)
 	p.admit.Increment(2)
 	p.admit.Increment(3)
-	p.Unlock()
+	p.admitMu.Unlock()
 
 	victims, added := p.Add(1, 1)
 	require.Nil(t, victims)
@@ -112,9 +114,9 @@ func TestPolicyUpdate(t *testing.T) {
 	p := newDefaultPolicy[int](100, 10)
 	p.Add(1, 1)
 	p.Update(1, 2)
-	p.Lock()
+	p.evictMu.Lock()
 	require.Equal(t, int64(2), p.evict.keyCosts[1])
-	p.Unlock()
+	p.evictMu.Unlock()
 }
 
 func TestPolicyCost(t *testing.T) {
@@ -307,5 +309,114 @@ func BenchmarkSampledLFUFillSample(b *testing.B) {
 				e.fillSample(make([]*policyPair, 0, lfuSample))
 			}
 		})
+	}
+}
+
+func BenchmarkPolicyAdd(b *testing.B) {
+	p := newDefaultPolicy[int](100000, 1000000)
+	p.CollectMetrics(newMetrics())
+	defer p.Close()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Add(uint64(i), 1)
+	}
+}
+
+func BenchmarkPolicyConcurrentAddHas(b *testing.B) {
+	concurrency := []struct {
+		name string
+		n    int
+	}{
+		{"2g", 2},
+		{"4g", 4},
+		{"8g", 8},
+		{"16g", 16},
+	}
+	for _, c := range concurrency {
+		b.Run(c.name, func(b *testing.B) {
+			p := newDefaultPolicy[int](100000, int64(b.N*2))
+			p.CollectMetrics(newMetrics())
+			defer p.Close()
+			b.ResetTimer()
+			b.SetParallelism(c.n)
+			b.RunParallel(func(pb *testing.PB) {
+				i := uint64(0)
+				for pb.Next() {
+					if i%2 == 0 {
+						p.Add(i, 1)
+					} else {
+						p.Has(i)
+					}
+					i++
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkPolicyConcurrentMixed(b *testing.B) {
+	concurrency := []struct {
+		name string
+		n    int
+	}{
+		{"2g", 2},
+		{"4g", 4},
+		{"8g", 8},
+		{"16g", 16},
+	}
+	for _, c := range concurrency {
+		b.Run(c.name, func(b *testing.B) {
+			p := newDefaultPolicy[int](100000, int64(b.N*2))
+			p.CollectMetrics(newMetrics())
+			defer p.Close()
+			b.ResetTimer()
+			b.SetParallelism(c.n)
+			b.RunParallel(func(pb *testing.PB) {
+				i := uint64(0)
+				for pb.Next() {
+					switch i % 10 {
+					case 0, 1, 2, 3:
+						p.Add(i, 1)
+					case 4, 5, 6:
+						p.Has(i)
+					case 7, 8:
+						p.Del(i)
+					case 9:
+						p.Push([]uint64{i, i + 1})
+					}
+					i++
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkPolicyPushParallel(b *testing.B) {
+	p := newDefaultPolicy[int](100000, 1000000)
+	p.CollectMetrics(newMetrics())
+	defer p.Close()
+	keys := []uint64{1, 2, 3, 4, 5}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			p.Push(keys)
+		}
+	})
+}
+
+func BenchmarkPolicyAddEviction(b *testing.B) {
+	p := newDefaultPolicy[int](100000, 1000)
+	p.CollectMetrics(newMetrics())
+	defer p.Close()
+	for i := 0; i < 1000; i++ {
+		p.Add(uint64(i), 1)
+	}
+	for i := 0; i < 5000; i++ {
+		p.Push([]uint64{uint64(i % 2000)})
+	}
+	time.Sleep(10 * time.Millisecond)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Add(uint64(i+10000), 1)
 	}
 }
